@@ -1,0 +1,5 @@
+fastapi
+gunicorn
+numpy
+pyyaml
+uvicorn[standard]

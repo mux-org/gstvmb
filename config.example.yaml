@@ -1,0 +1,27 @@
+# Example per-instance configuration for one camera.
+#
+# One container of this image serves exactly one camera. Mount this file into
+# the container and point $CONFIG_FILE at it (default: /app/config.yaml).
+#
+# Serving knobs (HOST, PORT, LOG_LEVEL, GST_DEBUG) stay as environment
+# variables; this file owns only the camera configuration.
+
+# Stable logical handle for this instance. Required. Used by your external
+# proxy/UI to address this camera (e.g. /cameras/cam0/...).
+id: cam0
+
+# Human-friendly display name. Optional; defaults to `id`.
+label: north dock
+
+# gst-launch description. Required. Used literally — no $VAR substitution.
+# Pin the device with `vmbsrc camera=<device id>`; the API parses it back out
+# of this string to report the bound device, so don't configure it twice.
+pipeline: |
+  vmbsrc camera=DEV_000A472EF00E !
+    videoconvert ! video/x-raw,format=I420 !
+    x264enc tune=zerolatency speed-preset=ultrafast bitrate=4000
+      key-int-max=30 bframes=0 !
+    video/x-h264,profile=constrained-baseline !
+    h264parse config-interval=1 !
+    queue !
+    rtspclientsink location=rtsp://localhost:8554/cam0 protocols=tcp
