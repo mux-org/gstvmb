@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
@@ -17,9 +17,16 @@ class CameraInfo(BaseModel):
 
 
 class PipelineStatus(BaseModel):
-    """Lifecycle snapshot for the underlying GStreamer pipeline."""
+    """Lifecycle snapshot for the underlying GStreamer pipeline.
 
-    running: bool
+    ``state`` encodes operator intent, not just liveness: ``idle`` (never
+    started since boot), ``playing``, ``stopped`` (deliberately stopped), and
+    ``error``. ``detail`` carries human context for the current state — chiefly
+    the last error reason — and is ``None`` when there's nothing to add.
+    """
+
+    state: Literal["idle", "playing", "stopped", "error"]
+    detail: str | None = None
     description: str
 
 

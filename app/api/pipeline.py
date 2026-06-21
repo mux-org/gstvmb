@@ -8,7 +8,11 @@ router = APIRouter()
 
 
 def _status(pipeline: Pipeline) -> PipelineStatus:
-    return PipelineStatus(running=pipeline.is_running(), description=pipeline.description)
+    return PipelineStatus(
+        state=pipeline.state,
+        detail=pipeline.detail,
+        description=pipeline.description,
+    )
 
 
 @router.get("", response_model=PipelineStatus, summary="Get pipeline status")

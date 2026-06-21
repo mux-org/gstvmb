@@ -186,6 +186,18 @@ class Pipeline:
         self._loop: GLib.MainLoop | None = None
         self._loop_thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        # Lifecycle state, exposed over the API. Encodes *operator intent*, not
+        # just liveness, so a UI can auto-start a fresh deployment while never
+        # reversing a deliberate stop:
+        #   idle    — never started since process boot
+        #   playing — built and PLAYING
+        #   stopped — an operator explicitly stopped it (stays off)
+        #   error   — start failed, or the bus reported ERROR/EOS
+        # The bus callback (``_on_bus_message``) writes these from the MainLoop
+        # thread without the lock; they are single-reference assignments (safe
+        # under the GIL) and readers tolerate a momentarily stale value.
+        self._state: str = "idle"
+        self._detail: str | None = None
 
     def _build(self) -> None:
         """Parse the description and start the MainLoop thread.
@@ -221,41 +233,66 @@ class Pipeline:
         """Handle bus messages delivered on the MainLoop thread.
 
         Logs ERROR messages and tears the pipeline down to NULL on either
-        ERROR or EOS so it doesn't sit in a half-broken PLAYING state. Other
+        ERROR or EOS so it doesn't sit in a half-broken PLAYING state, and
+        records the ``error`` state (with a human ``detail``) so ``state``
+        reports the truth instead of still claiming ``playing``. The
+        ``_pipeline`` reference is deliberately left in place — recovery is the
+        next :meth:`start`/:meth:`restart`, which tears down this dead pipeline
+        before rebuilding; the loop is not quit from its own thread here. Other
         message types are ignored.
         """
         t = msg.type
         if t == Gst.MessageType.ERROR:
             err, dbg = msg.parse_error()
             log.error("gst error: %s (%s)", err, dbg)
+            self._state = "error"
+            self._detail = str(err)
             if self._pipeline is not None:
                 self._pipeline.set_state(Gst.State.NULL)
         elif t == Gst.MessageType.EOS:
             log.info("gst eos")
+            self._state = "error"
+            self._detail = "end of stream"
             if self._pipeline is not None:
                 self._pipeline.set_state(Gst.State.NULL)
 
     def start(self) -> None:
         """Build the pipeline and transition it to PLAYING.
 
-        No-op if already running. On state-change failure the pipeline is
-        torn down and :class:`RuntimeError` is raised.
+        No-op if already ``playing``. A prior ``error`` (or any leftover
+        pipeline) is torn down first so a failed run can be recovered by
+        starting again. On state-change failure the pipeline is torn down,
+        ``state`` is set to ``error``, and :class:`RuntimeError` is raised.
         """
         with self._lock:
-            if self._pipeline is not None:
+            if self._state == "playing":
                 return
+            # Clear a dead/errored pipeline (and its orphaned MainLoop) before
+            # rebuilding; ``_on_bus_message`` leaves the reference in place.
+            if self._pipeline is not None:
+                self._teardown()
             self._build()
             ret = self._pipeline.set_state(Gst.State.PLAYING)
             if ret == Gst.StateChangeReturn.FAILURE:
                 self._teardown()
+                self._state = "error"
+                self._detail = "failed to set pipeline to PLAYING"
                 raise RuntimeError("failed to set pipeline to PLAYING")
+            self._state = "playing"
+            self._detail = None
 
     def stop(self) -> None:
-        """Tear the pipeline down to NULL and stop the MainLoop. No-op if not running."""
+        """Tear the pipeline down to NULL and record the deliberate stop.
+
+        Idempotent. Always lands in ``stopped`` (operator intent to stay off),
+        which is what suppresses UI auto-start; this is the deliberate
+        distinction from ``idle`` (never started).
+        """
         with self._lock:
-            if self._pipeline is None:
-                return
-            self._teardown()
+            if self._pipeline is not None:
+                self._teardown()
+            self._state = "stopped"
+            self._detail = None
 
     def restart(self) -> None:
         """Stop the pipeline (if running) and start it again.
@@ -268,8 +305,23 @@ class Pipeline:
         self.start()
 
     def is_running(self) -> bool:
-        """Return ``True`` if :meth:`start` has been called and the pipeline has not been torn down."""
-        return self._pipeline is not None
+        """Return ``True`` only while the pipeline is actually ``playing``.
+
+        Reflects real state, not just "``start`` was called": after a bus
+        ERROR/EOS this returns ``False`` even though a stale ``_pipeline``
+        reference lingers until the next start/restart.
+        """
+        return self._state == "playing"
+
+    @property
+    def state(self) -> str:
+        """Lifecycle state: ``idle`` | ``playing`` | ``stopped`` | ``error``."""
+        return self._state
+
+    @property
+    def detail(self) -> str | None:
+        """Human-readable context for the current state (e.g. the last error), or ``None``."""
+        return self._detail
 
     @property
     def description(self) -> str:
