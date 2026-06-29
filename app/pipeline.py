@@ -6,7 +6,15 @@ import gi
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GLib", "2.0")
+gi.require_version("GstApp", "1.0")
 from gi.repository import GLib, GObject, Gst  # noqa: E402
+
+# Importing GstApp for its side effect: it binds the AppSink action methods
+# (try_pull_sample, pull_sample) onto GstAppSink elements returned from the
+# pipeline. Without it those elements carry only base Gst.Element methods and
+# the pull raises AttributeError: 'GstAppSink' object has no attribute
+# 'try_pull_sample'.
+from gi.repository import GstApp  # noqa: E402,F401
 
 Gst.init(None)
 
