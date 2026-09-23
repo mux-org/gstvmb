@@ -87,3 +87,63 @@ class AppsinkInfo(BaseModel):
 
     name: str
     caps: dict[str, Any] | None = None
+
+
+class ExtentIn(BaseModel):
+    """What bounds a Capture.
+
+    Mirrors the ``{mode, value}`` shape in ``docs/data-capture-widget.md`` so the
+    time-bounded extents (``duration``, ``continuous``) are additive rather than
+    a breaking change. Only ``snapshot`` and ``count`` are implemented; the
+    others are accepted by the schema and rejected with 400 naming them, which
+    is more useful to a client than a validation error.
+    """
+
+    mode: str
+    value: int | None = None
+
+
+class CaptureRequest(BaseModel):
+    """Body of ``POST /capture/start``.
+
+    ``label`` is an operator name, sanitized and appended to a server-generated
+    timestamp — never the whole directory name, so two identically-labelled
+    captures cannot collide. ``capture_id`` overrides the generated name
+    entirely and exists for a future multi-source coordinator: handing the same
+    id to several source containers is what lands their files in one directory.
+    ``appsink`` need only be given if the pipeline has more than one.
+    """
+
+    extent: ExtentIn
+    label: str | None = None
+    capture_id: str | None = None
+    appsink: str | None = None
+
+
+class CaptureStatus(BaseModel):
+    """Snapshot of the current or most recent Capture.
+
+    Deliberately the same contract as :class:`PipelineStatus` — ``GET`` for
+    status, ``POST`` for commands, every response echoing the full object — so a
+    client polls both with one shape.
+
+    ``state`` distinguishes why a Capture is not running: ``idle`` (none since
+    boot), ``capturing``, ``complete`` (every requested frame written),
+    ``aborted`` (stopped by the operator), ``error`` (a dropped frame, a write
+    failure, or the pipeline dying underneath it). Because ``start`` returns 202,
+    ``detail`` is the only place a failure is explained — a silently-failing
+    science capture is unacceptable, so it is never empty for a bad outcome.
+
+    ``path`` is relative to the archive root, so it is meaningful on the host
+    even though it was produced inside a container.
+    """
+
+    state: Literal["idle", "capturing", "complete", "aborted", "error"]
+    detail: str | None = None
+    capture_id: str | None = None
+    label: str | None = None
+    path: str | None = None
+    requested: int | None = None
+    written: int = 0
+    started: str | None = None
+    finished: str | None = None

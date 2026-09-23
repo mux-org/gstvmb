@@ -1,6 +1,7 @@
 import logging
 import re
 import threading
+import time
 
 import gi
 
@@ -16,6 +17,8 @@ from gi.repository import GLib, GObject, Gst  # noqa: E402
 # 'try_pull_sample'.
 from gi.repository import GstApp  # noqa: E402,F401
 
+from app.clock import ClockReference  # noqa: E402
+
 Gst.init(None)
 
 log = logging.getLogger(__name__)
@@ -28,6 +31,27 @@ APPSINK_FACTORY = "appsink"
 # element. Anchored on a word boundary so it doesn't match e.g. a
 # hypothetical ``othercamera=`` property.
 _CAMERA_PROP_RE = re.compile(r"(?:^|\s)camera=(\S+)")
+
+# Default bound on an appsink's queue, applied whenever a description leaves it
+# unlimited. An appsink defaults to max-buffers=0 — UNLIMITED — and with
+# sync=false it accepts frames as fast as the device produces them, so a playing
+# pipeline nobody is draining grows without limit: at 1456x1088 uint16 that is
+# ~3.2 MB per frame, ~95 MB/s at 30 fps, until the container is OOM-killed.
+#
+# 32 frames is ~101 MB: enough slack to absorb write jitter, small enough to
+# notice. With drop=false (the appsink default) a full queue applies backpressure
+# to vmbsrc rather than discarding silently, and frames lost upstream of it show
+# up as PTS gaps — which is exactly what the capture's drop detector looks for.
+APPSINK_MAX_BUFFERS = 32
+
+# Ceiling on a single drain, so draining can never livelock against a camera
+# producing faster than we discard.
+DRAIN_LIMIT = 10_000
+
+# How long to wait for a pipeline to actually reach NULL, and for its MainLoop
+# thread to exit, during teardown. Bounded so a wedged element cannot hang an
+# API request forever, but long enough that the normal case always completes.
+TEARDOWN_TIMEOUT_S = 5.0
 
 # The vmbsrc property surface is exposed through hand-written ``/camera`` routes
 # (one per control) rather than a generic allowlist. Properties without a route
@@ -48,6 +72,17 @@ class AppsinkNotPresent(RuntimeError):
 
 class AppsinkTimeout(RuntimeError):
     """Raised when a blocking sample pull from an appsink times out."""
+
+
+class PipelineStartError(RuntimeError):
+    """Raised when a pipeline cannot be built or driven to PLAYING.
+
+    Chiefly a malformed gst-launch description — a typo, a property the
+    installed plugin does not have, or a caps filter nothing can negotiate.
+    That is a *configuration* fault, and the operator driving this from a UI has
+    no logs to read, so the reason travels in the exception message and is also
+    recorded in :attr:`Pipeline.detail` so ``GET /pipeline`` is self-diagnosing.
+    """
 
 
 def _find_by_factory(pipeline: Gst.Pipeline, factory_name: str) -> Gst.Element | None:
@@ -174,6 +209,25 @@ def _caps_to_dict(caps: Gst.Caps | None) -> dict | None:
     return result
 
 
+def _bound_appsink_queues(pipeline: Gst.Pipeline) -> None:
+    """Replace any unlimited appsink queue with a bounded one.
+
+    ``max-buffers=0`` means unlimited, and it is never a defensible choice for
+    this service — an unlimited queue is an unbounded memory leak for as long as
+    the pipeline plays. A description that sets its own positive bound is
+    honoured; only ``0`` is overridden, so "unlimited" is simply not reachable
+    from configuration.
+    """
+    for name, element in _find_appsinks(pipeline).items():
+        if element.get_property("max-buffers") == 0:
+            element.set_property("max-buffers", APPSINK_MAX_BUFFERS)
+            log.info(
+                "appsink %r had an unlimited queue; bounded to %d buffers",
+                name,
+                APPSINK_MAX_BUFFERS,
+            )
+
+
 class Pipeline:
     """Thread-safe wrapper around a GStreamer pipeline.
 
@@ -213,8 +267,17 @@ class Pipeline:
         Called from :meth:`start` under the lock. Leaves the pipeline in its
         default (NULL) state — the caller is responsible for transitioning to
         PLAYING.
+
+        A description GStreamer cannot parse raises :class:`PipelineStartError`
+        rather than letting a raw ``GLib.Error`` escape as an opaque 500 with
+        ``state`` still reporting ``idle``.
         """
-        pipeline = Gst.parse_launch(self._description)
+        try:
+            pipeline = Gst.parse_launch(self._description)
+        except GLib.Error as exc:
+            raise PipelineStartError(f"invalid pipeline description: {exc.message}") from exc
+
+        _bound_appsink_queues(pipeline)
         bus = pipeline.get_bus()
         bus.add_signal_watch()
         bus.connect("message", self._on_bus_message)
@@ -228,14 +291,50 @@ class Pipeline:
         self._loop_thread.start()
 
     def _teardown(self) -> None:
-        """Set the pipeline to NULL, quit the MainLoop, and drop references."""
-        if self._pipeline is not None:
-            self._pipeline.set_state(Gst.State.NULL)
-        if self._loop is not None and self._loop.is_running():
-            self._loop.quit()
+        """Set the pipeline to NULL, quit the MainLoop, and drop references.
+
+        The ordering matters and is the fix for a crash that made every failed
+        start undiagnosable: the process died (SIGABRT under gunicorn, SIGSEGV
+        standalone) instead of reporting why the pipeline would not start, so a
+        busy camera looked identical to a dead service.
+
+        Three things are needed, in this order:
+
+        1. **Remove the bus signal watch first.** ``_on_bus_message`` runs on the
+           MainLoop thread and touches ``self._pipeline``; a message delivered
+           while the pipeline is being dismantled lands on a half-destroyed
+           object.
+        2. **Wait for NULL to actually be reached.** ``set_state`` is
+           asynchronous. Dropping the last reference while elements are still
+           shutting down — which is exactly what a failed ``start`` does — is
+           what segfaults.
+        3. **Join the MainLoop thread.** It is a daemon, so without this the
+           interpreter can tear GStreamer down underneath a thread still inside
+           it.
+
+        Local references are taken up front so the instance attributes are clear
+        even if a step times out.
+        """
+        pipeline, loop, thread = self._pipeline, self._loop, self._loop_thread
         self._pipeline = None
         self._loop = None
         self._loop_thread = None
+
+        if pipeline is not None:
+            bus = pipeline.get_bus()
+            bus.remove_signal_watch()
+            pipeline.set_state(Gst.State.NULL)
+            pipeline.get_state(int(TEARDOWN_TIMEOUT_S * Gst.SECOND))
+
+        if loop is not None and loop.is_running():
+            loop.quit()
+        # Never join from the MainLoop thread itself — ``_on_bus_message`` runs
+        # there, and a future caller reaching teardown from a bus callback would
+        # otherwise deadlock on itself.
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=TEARDOWN_TIMEOUT_S)
+            if thread.is_alive():
+                log.warning("gst MainLoop thread did not exit within %.0fs", TEARDOWN_TIMEOUT_S)
 
     def _on_bus_message(self, _bus: Gst.Bus, msg: Gst.Message) -> None:
         """Handle bus messages delivered on the MainLoop thread.
@@ -269,8 +368,9 @@ class Pipeline:
 
         No-op if already ``playing``. A prior ``error`` (or any leftover
         pipeline) is torn down first so a failed run can be recovered by
-        starting again. On state-change failure the pipeline is torn down,
-        ``state`` is set to ``error``, and :class:`RuntimeError` is raised.
+        starting again. On any failure — an unparseable description or a refused
+        state change — the pipeline is torn down, ``state`` becomes ``error``
+        with the reason in ``detail``, and :class:`PipelineStartError` is raised.
         """
         with self._lock:
             if self._state == "playing":
@@ -279,13 +379,23 @@ class Pipeline:
             # rebuilding; ``_on_bus_message`` leaves the reference in place.
             if self._pipeline is not None:
                 self._teardown()
-            self._build()
+            try:
+                self._build()
+            except PipelineStartError as exc:
+                # Record before re-raising: without this ``state`` would still
+                # say ``idle`` ("never started") when the truth is "the config
+                # is broken", which is the one thing an operator must not be
+                # told wrongly.
+                self._teardown()
+                self._state = "error"
+                self._detail = str(exc)
+                raise
             ret = self._pipeline.set_state(Gst.State.PLAYING)
             if ret == Gst.StateChangeReturn.FAILURE:
                 self._teardown()
                 self._state = "error"
                 self._detail = "failed to set pipeline to PLAYING"
-                raise RuntimeError("failed to set pipeline to PLAYING")
+                raise PipelineStartError("failed to set pipeline to PLAYING")
             self._state = "playing"
             self._detail = None
 
@@ -340,6 +450,32 @@ class Pipeline:
     def device(self) -> str | None:
         """The bound Device id, parsed from the description's ``camera=`` (or ``None``)."""
         return parse_device(self._description)
+
+    def clock_reference(self) -> ClockReference:
+        """Sample the pipeline clock against the wall clock.
+
+        Buffer PTS is *running time* — monotonic, with no relation to UTC — so
+        converting a frame's timestamp to a real instant requires pairing the
+        two clocks once. Taken at the start of a Capture and written into the
+        file's header so every timestamp can be re-derived from the raw PTS
+        later (ADR-0010).
+
+        The two readings are taken as close together as possible; the gap
+        between them is the conversion's systematic error, and it is
+        microseconds against a wall clock whose own error is seconds.
+        """
+        with self._lock:
+            if self._pipeline is None:
+                raise AppsinkNotPresent("pipeline is not running")
+            base_time = self._pipeline.get_base_time()
+            clock = self._pipeline.get_pipeline_clock()
+            if clock is None:
+                raise AppsinkNotPresent("pipeline has no clock; is it playing?")
+            utc_s = time.time()
+            clock_ns = clock.get_time()
+        return ClockReference(
+            utc_s=utc_s, clock_ns=int(clock_ns), base_time_ns=int(base_time)
+        )
 
     def _require_vmbsrc(self) -> Gst.Element:
         """Return the pipeline's vmbsrc element or raise :class:`VmbSrcNotPresent`.
@@ -504,6 +640,30 @@ class Pipeline:
             "duration": None if buffer.duration == Gst.CLOCK_TIME_NONE else int(buffer.duration),
         }
         return data, caps or {}, meta
+
+    def drain_appsink(self, name: str, limit: int = DRAIN_LIMIT) -> int:
+        """Discard every already-queued sample and return how many were dropped.
+
+        An appsink is a FIFO: ``try_pull_sample`` returns the *oldest* buffer, so
+        a pipeline that has been playing for a while serves history, not the
+        present. Anything that means "what is the camera showing now" — a
+        snapshot, or the first frame of a Capture — has to drain first, or it
+        reads frames recorded before the request was even made. Without this a
+        400x exposure change produced no visible change in pulled frames.
+
+        Pulls with a zero timeout, so only buffers already queued are discarded;
+        the ``limit`` guards against livelocking if the device produces faster
+        than this loop can discard.
+        """
+        with self._lock:
+            element = self._require_appsink(name)
+
+        discarded = 0
+        while discarded < limit and element.try_pull_sample(0) is not None:
+            discarded += 1
+        if discarded:
+            log.debug("drained %d stale sample(s) from appsink %r", discarded, name)
+        return discarded
 
     def _require_appsink(self, name: str) -> Gst.Element:
         """Look up an appsink by element name or raise :class:`AppsinkNotPresent`.

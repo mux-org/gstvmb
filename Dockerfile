@@ -14,8 +14,21 @@ ENV PORT=8101
 # it is missing or invalid.
 ENV CONFIG_FILE=/app/config.yaml
 
+# Root of the capture archive INSIDE the container. The host directory holding
+# the science data is bind-mounted here at runtime (see scripts/prod_up.sh).
+# Every source container mounts the SAME host directory at this path and writes
+# under its own camera id, so one multi-source capture lands as sibling leaves
+# of a single tree rather than scattered across per-container volumes.
+#
+# Left unmounted, this is an ordinary directory in the container's ephemeral
+# overlay: writes succeed and are then destroyed by the next `podman restart`,
+# which `--restart unless-stopped` can trigger unattended. A capture must refuse
+# to start rather than write there — see the readiness check in the capture API.
+ENV DATA_ROOT=/data
+
 WORKDIR /app
 RUN touch ${CONFIG_FILE}
+RUN mkdir -p ${DATA_ROOT}
 
 RUN apt-get update && apt-get install -y \
     # Python
@@ -74,6 +87,37 @@ RUN if [ "$CAMSIM_XML" != "Dockerfile" ] && [ -n "$CAMSIM_XML" ]; then \
     else \
         rm VimbaCameraSimulatorTL.xml; \
     fi
+
+# Force ONE C++ runtime for the whole process, before Python starts.
+#
+# Without this, `import numpy` anywhere ahead of Gst.parse_launch() aborts the
+# process the moment a vmbsrc element is created:
+#
+#   terminate called after throwing an instance of 'xsde::cxx::parser::schema'
+#     what():  schema error
+#
+# It is not an XML problem. VimbaX's GenICam libraries are prebuilt against GCC
+# 8.4 (libXmlParser_GNU8_4_0_v3_2_AVT.so), numpy's _multiarray_umath links the
+# system libstdc++ (GCC 13 on noble), and CPython dlopen()s extension modules
+# with RTLD_LOCAL. That leaves two private link scopes for the same C++ runtime,
+# and C++ exception matching compares std::type_info by POINTER on its fast
+# path — so GenICam throws an exception its own catch block can no longer match,
+# it escapes to std::terminate, and the process aborts. The "schema error" is
+# just whatever exception happened to be in flight; the XML is fine.
+#
+# Preloading the system libstdc++ resolves it globally before any Python
+# extension is loaded, so typeinfo is unified no matter what imports what.
+#
+# Alternatives tested and rejected on 2026-09-10, both of which also worked:
+#   - sys.setdlopenflags(RTLD_GLOBAL) around the numpy import — breaks if any
+#     other module imports numpy first.
+#   - importing numpy lazily inside the FITS writer — breaks the moment someone
+#     adds a module-scope `import numpy` anywhere in app/.
+# Neither survives ordinary future edits. This does. See ADR-0011.
+#
+# DO NOT REMOVE without re-testing `POST /pipeline/start` on real hardware.
+ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6
+RUN test -e "$LD_PRELOAD" ||     (echo "FATAL: LD_PRELOAD target $LD_PRELOAD missing in this base image" && false)
 
 # Install app
 COPY app app

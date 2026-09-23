@@ -46,8 +46,22 @@ def pull_sample(
     name: str,
     wait: bool = Query(True, description="Block until a sample is available or timeout elapses."),
     timeout: float = Query(5.0, ge=0.0, description="Block timeout in seconds when wait=true."),
+    fresh: bool = Query(
+        True,
+        description=(
+            "Discard the appsink's queued backlog first, so the sample returned is the "
+            "next frame off the camera rather than the oldest queued one. Set false to "
+            "consume the queue in order instead."
+        ),
+    ),
     pipeline: Pipeline = Depends(get_pipeline),
 ) -> Response:
+    # An appsink is a FIFO, so without draining this endpoint reports history:
+    # on a pipeline that has been playing a while it returns frames recorded
+    # long before the request, which makes it useless for "what does the camera
+    # see now" — and actively misleading when probing a control change.
+    if fresh:
+        pipeline.drain_appsink(name)
     result = pipeline.pull_appsink_sample(name, timeout_s=timeout, wait=wait)
     if result is None:
         return Response(status_code=204)
@@ -94,11 +108,19 @@ def pull_samples(
     name: str,
     count: int = Query(..., ge=1, le=1000, description="Number of samples to pull."),
     timeout: float = Query(5.0, ge=0.0, description="Per-sample timeout in seconds."),
+    fresh: bool = Query(
+        True, description="Discard the appsink's queued backlog before the first sample."
+    ),
     pipeline: Pipeline = Depends(get_pipeline),
 ) -> StreamingResponse:
     # Validate eagerly so a missing appsink / stopped pipeline returns a clean
     # 404 instead of a streaming response containing only an error summary.
     pipeline.get_appsink_caps(name)
+
+    # Drain once up front: the sequence should start at the present, not at
+    # whatever is left over in the queue. Subsequent pulls are consecutive.
+    if fresh:
+        pipeline.drain_appsink(name)
 
     boundary = secrets.token_hex(16)
     sep = f"\r\n--{boundary}\r\n".encode()

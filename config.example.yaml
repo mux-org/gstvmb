@@ -13,6 +13,15 @@ id: cam0
 # Human-friendly display name. Optional; defaults to `id`.
 label: north dock
 
+# GenICam pixel format the camera is producing. Optional for a streaming-only
+# instance; REQUIRED before raw frames can be saved, because it cannot be
+# discovered at runtime: vmbsrc has no pixelformat property, and Mono10/12/14/16
+# all negotiate as the same video/x-raw,format=GRAY16_LE. Without it, nothing can
+# tell whether a saved pixel value tops out at 1023, 4095, 16383 or 65535.
+# One of: Mono8, Mono10, Mono12, Mono14, Mono16.
+# Must agree with the format the pipeline's capsfilter asks for.
+pixel_format: Mono12
+
 # gst-launch description. Required. Used literally — no $VAR substitution.
 # Pin the device with `vmbsrc camera=<device id>`; the API parses it back out
 # of this string to report the bound device, so don't configure it twice.
