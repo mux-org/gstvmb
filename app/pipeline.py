@@ -184,9 +184,17 @@ def _enum_str_to_int(pspec: GObject.ParamSpec, value: str) -> int:
     raise ValueError(f"invalid value {value!r} for {pspec.name}; expected one of {valid}")
 
 
-def _iter_pipeline_elements(pipeline: Gst.Pipeline):
-    """Yield every element in ``pipeline`` (recursively, including bins)."""
-    it = pipeline.iterate_recurse()
+def _iter_declared_elements(pipeline: Gst.Pipeline):
+    """Yield the elements the description declared: ``pipeline``'s direct children.
+
+    Not recursive, deliberately. Some elements are bins that build their own
+    app elements once PLAYING — ``rtspclientsink`` with ``protocols=tcp`` adds
+    ``appsink0``/``appsink1`` inside its ``rtspbin`` to carry RTP and RTCP.
+    Those are its private plumbing: listed, they made a Capture's default
+    Appsink ambiguous; pulled from, they would steal the stream's packets.
+    ``gst_parse_launch`` puts every element it names directly in the pipeline.
+    """
+    it = pipeline.iterate_elements()
     while True:
         result, value = it.next()
         if result == Gst.IteratorResult.DONE:
@@ -197,9 +205,9 @@ def _iter_pipeline_elements(pipeline: Gst.Pipeline):
 
 
 def _find_appsinks(pipeline: Gst.Pipeline) -> dict[str, Gst.Element]:
-    """Return all ``appsink`` elements in ``pipeline`` keyed by element name."""
+    """Return the declared ``appsink`` elements in ``pipeline`` keyed by name."""
     out: dict[str, Gst.Element] = {}
-    for element in _iter_pipeline_elements(pipeline):
+    for element in _iter_declared_elements(pipeline):
         factory = element.get_factory()
         if factory is not None and factory.get_name() == APPSINK_FACTORY:
             out[element.get_name()] = element
@@ -218,9 +226,9 @@ def _flow_name(flow) -> str:
 
 
 def _find_appsrcs(pipeline: Gst.Pipeline) -> dict[str, Gst.Element]:
-    """Return all ``appsrc`` elements in ``pipeline`` keyed by element name."""
+    """Return the declared ``appsrc`` elements in ``pipeline`` keyed by name."""
     out: dict[str, Gst.Element] = {}
-    for element in _iter_pipeline_elements(pipeline):
+    for element in _iter_declared_elements(pipeline):
         factory = element.get_factory()
         if factory is not None and factory.get_name() == APPSRC_FACTORY:
             out[element.get_name()] = element

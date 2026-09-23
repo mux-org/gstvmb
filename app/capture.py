@@ -41,7 +41,8 @@ from pathlib import Path
 from app import __version__
 from app.clock import ClockReference, clock_state, utc_to_iso
 from app.config import CameraConfig
-from app.fitscube import BLOCK, FitsCube, provenance_cards
+from app.display import DISPLAY_APPSINK
+from app.fitscube import BLOCK, FitsCube, date_obs_cards, provenance_cards
 from app.pipeline import AppsinkNotPresent, AppsinkTimeout, Pipeline
 
 log = logging.getLogger(__name__)
@@ -68,6 +69,13 @@ RESERVE_BYTES = 20 * 1024**3
 # Per-frame pull timeout. Generous: a long exposure legitimately produces frames
 # slowly, and a spurious timeout would abort a good Capture.
 PULL_TIMEOUT_S = 30.0
+
+# How long start() waits for the Appsink to negotiate caps. A View auto-starts
+# an idle Pipeline on open, so "open the View, press Capture" can arrive before
+# preroll; refusing would answer with a 409 that explains nothing. Short, and
+# taken before the state lock so status polls are never stalled by it.
+CAPS_WAIT_S = 2.0
+CAPS_POLL_S = 0.1
 
 # Drop detection. Cadence cannot be read from caps — the Appsink negotiates
 # framerate=0/1 because the Device free-runs — so it is learned from the first
@@ -235,7 +243,13 @@ class CaptureManager:
         Every precondition is checked *before* the thread starts, so a refusal is
         reported synchronously with a specific reason rather than appearing as an
         ``error`` state on a later poll.
+
+        The Appsink is resolved and its caps awaited *before* taking the lock:
+        the wait can last ``CAPS_WAIT_S``, and :meth:`status` shares the lock, so
+        waiting inside it would stall every status poll for that long.
         """
+        sink = self._resolve_appsink(appsink)
+        caps = self._require_caps(sink)
         with self._lock:
             if self._state.state == "capturing":
                 raise CaptureBusy(
@@ -244,8 +258,6 @@ class CaptureManager:
 
             label = sanitize_label(label)
             capture_id = self._resolve_capture_id(capture_id, label)
-            sink = self._resolve_appsink(appsink)
-            caps = self._require_caps(sink)
             width, height = caps["width"], caps["height"]
             frame_bytes = width * height * 2
 
@@ -281,7 +293,7 @@ class CaptureManager:
                 caps=caps.get("caps", ""),
                 exposure_us=exposure,
                 gain=gain,
-                first_utc_s=started_s,
+                provisional_utc_s=started_s,
                 reference=reference,
                 state=clock_state(),
                 capture_id=capture_id,
@@ -350,7 +362,14 @@ class CaptureManager:
         return capture_id
 
     def _resolve_appsink(self, name: str | None) -> str:
-        """Return the Appsink to pull from, defaulting to the only one present."""
+        """Return the Appsink to pull from, defaulting to the only capturable one.
+
+        The Display Pump's Appsink is left out of the default: it belongs to the
+        display transfer (ADR-0012), and pulling from it would steal the live
+        view's frames. With the tee pipeline that leaves exactly ``raw``, so a
+        client never has to know element names. Naming it explicitly is still
+        allowed.
+        """
         sinks = self._pipeline.list_appsinks()
         if name is not None:
             if name not in sinks:
@@ -358,26 +377,37 @@ class CaptureManager:
                     f"no appsink named {name!r}; present: {', '.join(sorted(sinks)) or 'none'}"
                 )
             return name
-        if not sinks:
+        candidates = sorted(s for s in sinks if s != DISPLAY_APPSINK)
+        if not candidates:
             raise CaptureNotReady(
-                "pipeline contains no appsink; a capture needs one (see the raw "
-                "pipeline in config.example.yaml)"
+                "pipeline contains no appsink a capture can use (the display pump's "
+                f"{DISPLAY_APPSINK!r} appsink is not one); see the raw pipeline in "
+                "config.example.yaml"
             )
-        if len(sinks) > 1:
+        if len(candidates) > 1:
             raise CaptureRejected(
-                f"pipeline has several appsinks ({', '.join(sorted(sinks))}); name one"
+                f"pipeline has several appsinks ({', '.join(candidates)}); name one"
             )
-        return next(iter(sinks))
+        return candidates[0]
 
     def _require_caps(self, sink: str) -> dict:
-        """Return negotiated caps, or explain why the Capture cannot size itself."""
-        caps = self._pipeline.get_appsink_caps(sink)
-        if not caps or "width" not in caps or "height" not in caps:
-            raise CaptureNotReady(
-                f"appsink {sink!r} has not negotiated caps yet; the pipeline must be "
-                "playing and producing frames before a capture can start"
-            )
-        return caps
+        """Return negotiated caps, waiting briefly for preroll.
+
+        Explains why the Capture cannot size itself if caps have not arrived
+        within ``CAPS_WAIT_S``.
+        """
+        deadline = time.monotonic() + CAPS_WAIT_S
+        while True:
+            caps = self._pipeline.get_appsink_caps(sink)
+            if caps and "width" in caps and "height" in caps:
+                return caps
+            if time.monotonic() >= deadline:
+                raise CaptureNotReady(
+                    f"appsink {sink!r} has not negotiated caps after {CAPS_WAIT_S:g} s; "
+                    "the pipeline must be playing and producing frames before a "
+                    "capture can start"
+                )
+            time.sleep(CAPS_POLL_S)
 
     def _require_pixel_format(self) -> None:
         if self._config.pixel_format is None:
@@ -500,6 +530,10 @@ class CaptureManager:
             final, detail = "error", f"{type(exc).__name__}: {exc}"
         finally:
             try:
+                # The header went out before any frame existed; replace its
+                # provisional DATE-OBS with the one frame zero actually gives.
+                if cube.first_utc_s is not None:
+                    cube.update_cards(date_obs_cards(cube.first_utc_s, exposure_us))
                 written = cube.close()
             except Exception as exc:  # noqa: BLE001
                 log.exception("failed to finalize capture file")

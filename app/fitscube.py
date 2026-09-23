@@ -17,7 +17,9 @@ camera right-aligns (measured), but the convention is correct either way and
 costs nothing.
 
 **Timing lives in the extension, not the header.** The primary header holds one
-``DATE-OBS``, describing frame zero. Per-frame times go in a ``FRAMETIME``
+``DATE-OBS``, describing frame zero — provisional when the file is opened,
+before any frame exists, and rewritten at :meth:`FitsCube.close` from frame
+zero's arrival. Per-frame times go in a ``FRAMETIME``
 binary table, because the Appsink negotiates ``framerate=0/1`` — the device
 free-runs, so there is no cadence to interpolate from. See ADR-0010.
 """
@@ -108,6 +110,8 @@ class FitsCube:
         self._frame_bytes = width * height * 2
 
         self._times: list[tuple[int, int, float, bool]] = []
+        self._first_utc_s: float | None = None
+        self._cards_changed = False
 
         self._file = open(path, "wb")
         self._header_len = len(self._header_string(expected))
@@ -117,6 +121,27 @@ class FitsCube:
     def written(self) -> int:
         """Number of frames appended so far."""
         return self._written
+
+    @property
+    def first_utc_s(self) -> float | None:
+        """Unix epoch seconds of frame zero's arrival, or ``None`` before it."""
+        return self._first_utc_s
+
+    def update_cards(self, cards: list[tuple[str, object, str]]) -> None:
+        """Replace the value and comment of existing header cards.
+
+        Takes effect at :meth:`close`, which rewrites the header in place. Only
+        cards already present may be updated: adding one could grow the header
+        by a block and shear the data behind it.
+
+        :raises KeyError: if a keyword is not already in the header.
+        """
+        index = {kw: i for i, (kw, _, _) in enumerate(self._header_cards) if kw != "COMMENT"}
+        for keyword, value, comment in cards:
+            if keyword not in index:
+                raise KeyError(f"no {keyword} card to update")
+            self._header_cards[index[keyword]] = (keyword, value, comment)
+        self._cards_changed = True
 
     def _header_string(self, naxis3: int) -> bytes:
         """Render the primary header, padded to a whole number of FITS blocks.
@@ -162,14 +187,17 @@ class FitsCube:
                 f"({self._width}x{self._height} uint16)"
             )
         self._file.write(frame_to_fits_bytes(data))
+        if self._first_utc_s is None:
+            self._first_utc_s = utc_s
         self._times.append((self._written, pts_ns, utc_to_mjd(utc_s), dropped_before))
         self._written += 1
 
     def close(self) -> int:
         """Finish the file and return the frame count actually written.
 
-        Pads the data segment to a block boundary, corrects ``NAXIS3`` if the
-        Capture ended early, then appends the ``FRAMETIME`` extension. Safe to
+        Pads the data segment to a block boundary, rewrites the header in place
+        if ``NAXIS3`` changed (the Capture ended early) or cards were updated
+        (:meth:`update_cards`), then appends the ``FRAMETIME`` extension. Safe to
         call twice; the second call is a no-op.
         """
         if self._file.closed:
@@ -179,9 +207,9 @@ class FitsCube:
         if remainder:
             self._file.write(b"\0" * (BLOCK - remainder))
 
-        if self._written != self._expected:
+        if self._written != self._expected or self._cards_changed:
             patched = self._header_string(self._written)
-            # A card is 80 bytes whatever integer it holds, so the patched header
+            # A card is 80 bytes whatever value it holds, so the patched header
             # occupies the same blocks as the original. Asserted rather than
             # assumed: writing a different length here would shear the data.
             if len(patched) != self._header_len:
@@ -225,6 +253,21 @@ class FitsCube:
         self.close()
 
 
+def date_obs_cards(arrival_utc_s: float, exposure_us: float | None) -> list[tuple[str, object, str]]:
+    """``DATE-OBS``/``MJD-OBS`` for a frame that arrived at ``arrival_utc_s``.
+
+    The estimated exposure start: arrival minus the exposure time (ADR-0010).
+    One formula, used twice — for the provisional value written when the file
+    opens, and for the real one :class:`~app.capture.CaptureManager` sets from
+    frame zero before closing.
+    """
+    date_obs_s = arrival_utc_s - (exposure_us or 0.0) / 1e6
+    return [
+        ("DATE-OBS", utc_to_iso(date_obs_s), "estimated exposure start, frame 0"),
+        ("MJD-OBS", utc_to_mjd(date_obs_s), "MJD of DATE-OBS"),
+    ]
+
+
 def provenance_cards(
     *,
     camera_id: str,
@@ -235,7 +278,7 @@ def provenance_cards(
     caps: str,
     exposure_us: float | None,
     gain: float | None,
-    first_utc_s: float,
+    provisional_utc_s: float,
     reference: ClockReference,
     state: ClockState,
     capture_id: str,
@@ -246,18 +289,19 @@ def provenance_cards(
 
     ``DATE-OBS`` is the *estimated* exposure start of the first frame — arrival
     minus the exposure time — and carries an unmodelled transport-latency
-    systematic. ``CLOCKSYN``/``TIMEERR`` record whether the host clock was
+    systematic. No frame exists when the header is first written, so it is
+    computed here from ``provisional_utc_s`` (when the Capture was commanded) and
+    rewritten from frame zero's actual arrival before the file closes; it stays
+    provisional only in a file with no frames. ``CLOCKSYN``/``TIMEERR`` record whether the host clock was
     disciplined at all, so a file written on an unsynchronized host is
     distinguishable from a correct one years later without anyone remembering.
     ``CLKREF``/``PTSREF`` are the sampled offset pair, retained so every
     timestamp can be re-derived from the raw PTS. All four are ADR-0010.
     """
     exposure_s = (exposure_us or 0.0) / 1e6
-    date_obs_s = first_utc_s - exposure_s
 
     cards: list[tuple[str, object, str]] = [
-        ("DATE-OBS", utc_to_iso(date_obs_s), "estimated exposure start, frame 0"),
-        ("MJD-OBS", utc_to_mjd(date_obs_s), "MJD of DATE-OBS"),
+        *date_obs_cards(provisional_utc_s, exposure_us),
         ("TIMESYS", "UTC", "time scale for DATE-OBS/MJD-OBS"),
         ("EXPTIME", exposure_s, "[s] exposure time"),
     ]
