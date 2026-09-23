@@ -2,6 +2,7 @@ from fastapi import Request
 
 from app.capture import CaptureManager
 from app.config import CameraConfig
+from app.display import DisplayPump
 from app.pipeline import Pipeline
 
 
@@ -31,3 +32,13 @@ def get_capture(request: Request) -> CaptureManager:
     Capture, which is a physical limit (one Device, one Appsink), not policy.
     """
     return request.app.state.capture
+
+
+def get_display(request: Request) -> DisplayPump:
+    """FastAPI dependency yielding the process-wide :class:`DisplayPump`.
+
+    Created during app startup (see :func:`app.main.lifespan`) and stored on
+    ``app.state.display``. Its :meth:`~app.display.DisplayPump.status` is the
+    first thing to read when the stream is up but the picture is wrong.
+    """
+    return request.app.state.display

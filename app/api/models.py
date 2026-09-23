@@ -147,3 +147,29 @@ class CaptureStatus(BaseModel):
     written: int = 0
     started: str | None = None
     finished: str | None = None
+
+
+class DisplayStatus(BaseModel):
+    """Snapshot of the Display Pump — the in-process 16→8 bit transfer (ADR-0012).
+
+    The one place to look when the Pipeline says ``playing`` but the live view
+    is frozen or black. ``frames_in`` counts frames pulled from the display
+    Appsink, ``frames_out`` frames pushed to the Appsrc; a gap between them means
+    frames are being refused (see ``last_error``), and neither moving means no
+    frames are reaching the pump at all. ``seconds_since_last_frame`` answers
+    "is it flowing now" without polling twice.
+
+    ``disabled`` is set, and ``running`` false, when the pump has correctly
+    concluded it has nothing to do: no ``pixel_format`` declared, or a
+    description with no display Appsink. That is not an error.
+    """
+
+    running: bool
+    disabled: str | None = None
+    transfer: str
+    bit_depth: int | None = None
+    frames_in: int
+    frames_out: int
+    errors: int
+    last_error: str | None = None
+    seconds_since_last_frame: float | None = None
