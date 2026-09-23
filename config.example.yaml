@@ -22,6 +22,17 @@ label: north dock
 # Must agree with the format the pipeline's capsfilter asks for.
 pixel_format: Mono12
 
+# How the display branch reduces 16-bit frames to the 8 bits H.264 carries.
+# Optional; defaults to `sqrt`. Only consulted by an instance whose pipeline has
+# a display appsink/appsrc pair (see below) — a pipeline that feeds the encoder
+# directly ignores it.
+#   sqrt   — default; lifts the low end without exaggerating the noise floor
+#   log    — strongest lift, for faint signal beside something much brighter
+#   linear — correct full-range rescale, no perceptual encode; honest but dim
+# This is applied ONCE on the server, while the data is still 16-bit. It is not
+# a viewer control: the client re-stretches interactively on top of it.
+display_transfer: sqrt
+
 # gst-launch description. Required. Used literally — no $VAR substitution.
 # Pin the device with `vmbsrc camera=<device id>`; the API parses it back out
 # of this string to report the bound device, so don't configure it twice.
@@ -34,3 +45,38 @@ pipeline: |
     h264parse config-interval=1 !
     queue !
     rtspclientsink location=rtsp://localhost:8554/cam0 protocols=tcp
+
+# A pipeline that must BOTH save raw frames and stream needs a tee, and the
+# display branch cannot simply `videoconvert` to 8-bit: that scales GRAY16_LE as
+# though the words were full-range 16-bit, so 10- or 12-bit right-aligned data
+# arrives at the encoder as near-black. No GStreamer element applies a curve to
+# GRAY16_LE (gamma, videobalance and glupload all refuse it), so the display
+# branch leaves through an appsink named `display`, is transformed in process,
+# and re-enters at an appsrc named `display_src`. Those two names are fixed.
+#
+#   vmbsrc camera=DEV_000A472EF00E !
+#     video/x-raw,format=GRAY16_LE !
+#     tee name=t
+#   t. ! queue ! appsink name=raw sync=false drop=true
+#   t. ! queue leaky=downstream max-size-buffers=4 !
+#     appsink name=display sync=false drop=true max-buffers=2
+#   appsrc name=display_src format=time is-live=true do-timestamp=false block=false
+#       caps="video/x-raw,format=GRAY8,width=<W>,height=<H>,framerate=0/1" !
+#     queue leaky=downstream max-size-buffers=3 !
+#     videoconvert ! video/x-raw,format=I420 !
+#     x264enc tune=zerolatency speed-preset=ultrafast ! ...
+#
+# Two settings here are load-bearing, and both failed on hardware without them:
+#
+#   caps= on display_src — the appsrc must be born knowing its format, with W/H
+#     matching what vmbsrc negotiates. rtspclientsink announces at PLAYING,
+#     before any frame exists to learn it from, and a restarted pipeline gets a
+#     fresh appsrc that knows nothing. Missing or stale caps fail as
+#     not-negotiated reported against display_src.
+#
+#   drop=true on the raw appsink — with no Capture running nothing drains it,
+#     and a drop=false sink that fills blocks the tee and freezes BOTH branches.
+#     A Capture still detects every missed frame as a PTS gap.
+#
+# Only the display branch leaks under load: dropping a Display Frame is free,
+# dropping a Raw Frame during a Capture is detected and aborts it.

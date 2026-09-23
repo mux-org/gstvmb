@@ -25,6 +25,7 @@ log = logging.getLogger(__name__)
 
 VMBSRC_FACTORY = "vmbsrc"
 APPSINK_FACTORY = "appsink"
+APPSRC_FACTORY = "appsrc"
 
 # Matches the vmbsrc ``camera=<device id>`` assignment in a gst-launch
 # description so the bound Device id can be reported without a running
@@ -39,9 +40,17 @@ _CAMERA_PROP_RE = re.compile(r"(?:^|\s)camera=(\S+)")
 # ~3.2 MB per frame, ~95 MB/s at 30 fps, until the container is OOM-killed.
 #
 # 32 frames is ~101 MB: enough slack to absorb write jitter, small enough to
-# notice. With drop=false (the appsink default) a full queue applies backpressure
-# to vmbsrc rather than discarding silently, and frames lost upstream of it show
-# up as PTS gaps — which is exactly what the capture's drop detector looks for.
+# notice. With drop=false (the appsink default) a full queue does not discard
+# silently, and frames lost upstream of it show up as PTS gaps — which is
+# exactly what the capture's drop detector looks for.
+#
+# vmbsrc is ZERO-COPY: each buffer is one of the Device's `framebuffers`, handed
+# back to the camera only when released. So a full appsink does not so much
+# backpressure vmbsrc as hold its frames, and a description whose `framebuffers`
+# does not exceed this bound (plus any other downstream retention) stops the
+# Device acquiring whenever nothing drains the sink. That is a property of the
+# description, not something this module can enforce — see
+# docs/raw-frame-capture.md, Known gaps item 12.
 APPSINK_MAX_BUFFERS = 32
 
 # Ceiling on a single drain, so draining can never livelock against a camera
@@ -72,6 +81,19 @@ class AppsinkNotPresent(RuntimeError):
 
 class AppsinkTimeout(RuntimeError):
     """Raised when a blocking sample pull from an appsink times out."""
+
+
+class AppsrcNotPresent(RuntimeError):
+    """Raised when an appsrc operation targets a name that isn't bound to an
+    ``appsrc`` element in the running pipeline (or the pipeline isn't running)."""
+
+
+class AppsrcPushError(RuntimeError):
+    """Raised when an appsrc rejects a pushed buffer with a hard flow error.
+
+    A pipeline shutting down answers ``FLUSHING``, which is expected and is not
+    raised — only a genuine failure reaches the caller.
+    """
 
 
 class PipelineStartError(RuntimeError):
@@ -184,6 +206,27 @@ def _find_appsinks(pipeline: Gst.Pipeline) -> dict[str, Gst.Element]:
     return out
 
 
+def _flow_name(flow) -> str:
+    """Name a ``Gst.FlowReturn`` for a log line without assuming its Python type.
+
+    PyGObject hands back a registered enum here, which carries ``value_nick``,
+    but the signal is declared as returning a plain integer and a build that
+    takes it at its word would turn a diagnostic into an ``AttributeError`` on
+    the push path. The name is a nicety; the push is not.
+    """
+    return getattr(flow, "value_nick", None) or str(flow)
+
+
+def _find_appsrcs(pipeline: Gst.Pipeline) -> dict[str, Gst.Element]:
+    """Return all ``appsrc`` elements in ``pipeline`` keyed by element name."""
+    out: dict[str, Gst.Element] = {}
+    for element in _iter_pipeline_elements(pipeline):
+        factory = element.get_factory()
+        if factory is not None and factory.get_name() == APPSRC_FACTORY:
+            out[element.get_name()] = element
+    return out
+
+
 def _caps_to_dict(caps: Gst.Caps | None) -> dict | None:
     """Convert a :class:`Gst.Caps` to a JSON-serializable dict.
 
@@ -226,6 +269,26 @@ def _bound_appsink_queues(pipeline: Gst.Pipeline) -> None:
                 name,
                 APPSINK_MAX_BUFFERS,
             )
+
+
+def _force_appsrc_time_format(pipeline: Gst.Pipeline) -> None:
+    """Put every appsrc in ``format=time``, whatever the description asked for.
+
+    An appsrc defaults to ``format=bytes``, in which segment position is a byte
+    offset and the PTS on a pushed buffer is ignored. Everything downstream of
+    the display appsrc — the encoder's rate control, RTSP timestamping, and the
+    browser's playback clock — is driven by those timestamps, so a description
+    that forgets ``format=time`` does not fail loudly: it streams video whose
+    frames all claim to arrive at once.
+
+    Overridden rather than validated, on the same reasoning as
+    :func:`_bound_appsink_queues`: there is no configuration for which ``bytes``
+    is the right answer here, so it is simply not reachable.
+    """
+    for name, element in _find_appsrcs(pipeline).items():
+        if element.get_property("format") != Gst.Format.TIME:
+            element.set_property("format", Gst.Format.TIME)
+            log.info("appsrc %r was not in format=time; overridden", name)
 
 
 class Pipeline:
@@ -278,6 +341,7 @@ class Pipeline:
             raise PipelineStartError(f"invalid pipeline description: {exc.message}") from exc
 
         _bound_appsink_queues(pipeline)
+        _force_appsrc_time_format(pipeline)
         bus = pipeline.get_bus()
         bus.add_signal_watch()
         bus.connect("message", self._on_bus_message)
@@ -676,4 +740,85 @@ class Pipeline:
         element = appsinks.get(name)
         if element is None:
             raise AppsinkNotPresent(f"no appsink named {name!r}")
+        return element
+
+    # ------------------------------------------------------------------ appsrc
+
+    def list_appsrcs(self) -> list[str]:
+        """Return the element names of every appsrc in the running pipeline.
+
+        Raises :class:`AppsrcNotPresent` if the pipeline isn't running, which is
+        how a caller distinguishes "no pipeline yet" from "this description has
+        no appsrc in it".
+        """
+        with self._lock:
+            if self._pipeline is None:
+                raise AppsrcNotPresent("pipeline is not running")
+            return sorted(_find_appsrcs(self._pipeline))
+
+    def get_appsrc_caps(self, name: str) -> dict | None:
+        """Return the caps an appsrc was declared with, or ``None`` if it has none.
+
+        Declared in the Pipeline description (``appsrc caps="..."``), so every
+        appsrc is born knowing its format rather than learning it from whoever
+        pushes first. Raises :class:`AppsrcNotPresent` for an unknown name or
+        unstarted pipeline.
+        """
+        with self._lock:
+            element = self._require_appsrc(name)
+        return _caps_to_dict(element.get_property("caps"))
+
+    def push_appsrc_frame(
+        self,
+        name: str,
+        data: bytes,
+        *,
+        pts: int | None = None,
+        dts: int | None = None,
+        duration: int | None = None,
+    ) -> None:
+        """Push one frame into a named appsrc, carrying its timing forward.
+
+        ``pts``/``dts``/``duration`` are nanoseconds, in the shape
+        :meth:`pull_appsink_sample` reports them, and ``None`` leaves the field
+        unset. Passing through the *source* buffer's timestamps rather than
+        re-stamping is what keeps a transformed frame aligned with the frame it
+        was made from — both branches then carry one pipeline running time.
+
+        Raises :class:`AppsrcNotPresent` for an unknown name or unstarted
+        pipeline, and :class:`AppsrcPushError` on a hard flow error. A pipeline
+        being torn down answers ``FLUSHING``; that is normal and returns quietly.
+
+        The element lookup is done under the lock; the push itself is not, so a
+        slow consumer cannot serialize other API calls behind it.
+        """
+        with self._lock:
+            element = self._require_appsrc(name)
+
+        buffer = Gst.Buffer.new_wrapped(data)
+        if pts is not None:
+            buffer.pts = pts
+        if dts is not None:
+            buffer.dts = dts
+        if duration is not None:
+            buffer.duration = duration
+
+        flow = element.emit("push-buffer", buffer)
+        if flow == Gst.FlowReturn.OK:
+            return
+        if flow in (Gst.FlowReturn.FLUSHING, Gst.FlowReturn.EOS):
+            log.debug("appsrc %r returned %s; pipeline is stopping", name, _flow_name(flow))
+            return
+        raise AppsrcPushError(f"appsrc {name!r} rejected a buffer: {_flow_name(flow)}")
+
+    def _require_appsrc(self, name: str) -> Gst.Element:
+        """Look up an appsrc by element name or raise :class:`AppsrcNotPresent`.
+
+        Caller must hold :attr:`_lock`.
+        """
+        if self._pipeline is None:
+            raise AppsrcNotPresent("pipeline is not running")
+        element = _find_appsrcs(self._pipeline).get(name)
+        if element is None:
+            raise AppsrcNotPresent(f"no appsrc named {name!r}")
         return element

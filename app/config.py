@@ -42,6 +42,28 @@ PIXEL_FORMATS: dict[str, int] = {
 }
 
 
+# How the Display Frame branch packs GRAY16 into the 8 bits H.264 can carry.
+# ADR-0002 requires this transfer to happen while the data is still 16-bit: a
+# plain linear reduction of right-aligned 10/12-bit ADU is what turns a live
+# field into a black rectangle, because videoconvert scales GRAY16_LE as if the
+# words were full-range 16-bit (a saturated 10-bit pixel lands at luma 3/255).
+#
+#   sqrt   — the default. Lifts the low end hard enough to see sky structure
+#            without the exaggerated noise floor `log` gives on a dark field.
+#   log    — strongest low-end lift; use when the interesting signal is faint
+#            against a much brighter source in frame.
+#   linear — no perceptual encode, just a correct rescale to full 8-bit range.
+#            Honest but dim; mostly useful as a reference when judging the
+#            others.
+#
+# This is a *fixed* encode, not a viewer control: palmcao re-stretches
+# interactively on the client (ADR-0002), so this only has to preserve detail
+# for that shader to find, not look right on its own.
+DISPLAY_TRANSFERS: frozenset[str] = frozenset({"linear", "sqrt", "log"})
+
+DEFAULT_DISPLAY_TRANSFER = "sqrt"
+
+
 class ConfigError(RuntimeError):
     """Raised when the instance configuration is missing or invalid."""
 
@@ -55,14 +77,20 @@ class CameraConfig:
     :param pipeline: gst-launch description, used literally.
     :param pixel_format: GenICam pixel format the Device is producing (e.g.
         ``Mono12``), or ``None`` when undeclared. Optional because a
-        streaming-only Instance never needs it; required before a Capture,
-        which cannot interpret Raw Frames without it.
+        streaming-only Instance never needs it; required before a Capture — and
+        now also before the Display Frame branch of a tee'd description, which
+        cannot pick a transfer curve without knowing the bit depth.
+    :param display_transfer: transfer curve the Display Frame branch applies
+        when reducing GRAY16 to 8-bit. One of :data:`DISPLAY_TRANSFERS`;
+        defaults to ``sqrt``. Only consulted by an Instance whose description
+        has a display Appsink/Appsrc pair.
     """
 
     id: str
     label: str
     pipeline: str
     pixel_format: str | None = None
+    display_transfer: str = DEFAULT_DISPLAY_TRANSFER
 
     @property
     def bit_depth(self) -> int | None:
@@ -113,9 +141,37 @@ def load_config(path: Path = CONFIG_FILE) -> CameraConfig:
         raise ConfigError("config field 'label' must be a string")
 
     pixel_format = _parse_pixel_format(raw.get("pixel_format"))
+    display_transfer = _parse_display_transfer(raw.get("display_transfer"))
 
     return CameraConfig(
-        id=cam_id, label=label, pipeline=pipeline, pixel_format=pixel_format
+        id=cam_id,
+        label=label,
+        pipeline=pipeline,
+        pixel_format=pixel_format,
+        display_transfer=display_transfer,
+    )
+
+
+def _parse_display_transfer(value) -> str:
+    """Validate an optional ``display_transfer``, defaulting to ``sqrt``.
+
+    An unrecognised value is a hard error rather than a fallback to the default:
+    a typo that silently downgraded the encode would show up as a picture that
+    is merely *worse*, which is far harder to notice than a service that refuses
+    to start.
+    """
+    if value is None:
+        return DEFAULT_DISPLAY_TRANSFER
+    if not isinstance(value, str):
+        raise ConfigError("config field 'display_transfer' must be a string")
+
+    needle = value.strip().casefold()
+    if needle in DISPLAY_TRANSFERS:
+        return needle
+
+    valid = ", ".join(sorted(DISPLAY_TRANSFERS))
+    raise ConfigError(
+        f"config field 'display_transfer' has unknown value {value!r}; expected one of {valid}"
     )
 
 
