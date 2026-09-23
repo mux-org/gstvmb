@@ -65,7 +65,13 @@ It is a **queue, not a tap**: it holds a backlog and hands out the *oldest*
 frame first, so anything that means "what is the camera showing now" must
 discard the backlog before reading. An unbounded backlog is also an unbounded
 memory leak, so this service never allows one.
-_Avoid_: sink, endpoint, tap (a tap implies the present; this is a queue)
+Its backlog is also **the Device's own frames**: `vmbsrc` is zero-copy, so every
+buffer an Appsink holds is a camera frame buffer the Device cannot refill until
+it is released. An Appsink as deep as `framebuffers` stops acquisition outright
+— silently — which is why `framebuffers` is sized as a budget against everything
+downstream that retains buffers, not as a cushion.
+_Avoid_: sink, endpoint, tap (a tap implies the present; this is a queue),
+cushion (it holds camera frames, not copies of them)
 
 **Raw Frame**:
 One buffer pulled from an Appsink that has been kept out of the display path
@@ -78,19 +84,45 @@ _Avoid_: raw bytes, raw data, image (all three are used loosely for three
 different things — see Flagged ambiguities)
 
 **Pixel format**:
-The GenICam format the Device is producing — measured as `Mono10` on the
-acquisition Camera, despite ADR-0002 assuming 12-bit. It is **declared, never discovered**: `GRAY16_LE` is a container, not a
-depth, and Mono10/12/14/16 negotiate identically, so no Instance can determine
-by inspection whether its values top out at 1023, 4095, 16383 or 65535. Like the
-Device id, it is a hardware fact pinned in the one config file. Bit depth is
-derived from it, never configured alongside it.
+The GenICam format the Device is producing — confirmed as `Mono10` on the
+acquisition Camera, despite ADR-0002 assuming 12-bit. It is **declared, never
+discovered** *by an Instance*: `GRAY16_LE` is a container, not a depth, and
+Mono10/12/14/16 negotiate identically, so nothing in a running Pipeline can tell
+whether its values top out at 1023, 4095, 16383 or 65535. The Camera itself will
+say — `ListFeatures_VmbC` reads `PixelFormat` straight off the node map — but
+only with the Device claim in hand, which is the one thing a running Instance
+cannot give up to ask. So it stays a hardware fact pinned in the one config file,
+like the Device id. Bit depth is derived from it, never configured alongside it.
 _Avoid_: bit depth (that is derived), resolution (means pixel count here),
-GRAY16_LE (that is the GStreamer container, not the format)
+GRAY16_LE (that is the GStreamer container, not the format), "unknowable" (it is
+knowable; it is just not knowable from inside the Pipeline)
 
 **Display Frame**:
 A frame on the encoding path: reduced to 8 bits and H.264-encoded for the live
 WebRTC view. Display-grade, never photometric (ADR-0002).
 _Avoid_: preview, stream frame
+
+**Display Transfer**:
+The curve mapping 16-bit ADU onto the 8 bits H.264 can carry — `sqrt` (default),
+`log` or `linear`, declared per Instance. **Fixed, not a viewer control**: it is
+applied once on the server so faint detail survives into 8 bits, and palmcao
+re-stretches interactively on top of it. Applying it *while the data is still
+16-bit* is the whole point — a plain `videoconvert` reduction treats GRAY16_LE
+as full-range, which on this right-aligned 10-bit Device lands a saturated pixel
+at luma 3/255 and shows a black picture.
+_Avoid_: stretch (that is the client's interactive control), gamma (one curve
+among the three), LUT (the implementation, not the concept)
+
+**Display Pump**:
+The in-process loop that carries Display Frames across the Appsink → Appsrc gap:
+it pulls GRAY16, applies the Display Transfer, and pushes GRAY8 back into the
+Pipeline for the encoder. It exists because **no GStreamer element will do it** —
+`gamma`, `videobalance` and `glupload` all reject `GRAY16_LE`. It is allowed to
+drop frames and the Capture is not, so it never applies backpressure to the tee.
+Its health is served at `GET /display`: frames in, frames out, errors, and
+seconds since the last frame — the first thing to read when the Pipeline says
+`playing` but the live view is frozen.
+_Avoid_: filter, transform element (it is not an element; that is the point)
 
 ### Capture
 
