@@ -49,8 +49,6 @@ log = logging.getLogger(__name__)
 
 DATA_ROOT = Path(os.environ.get("DATA_ROOT", "/data"))
 
-FRAMES_FILENAME = "frames.fits"
-
 # Extents bounded by frame count can promise completeness and can have their
 # size computed before the first frame. Only these are implemented; the
 # time-bounded extents named in docs/data-capture-widget.md are rejected with a
@@ -301,7 +299,7 @@ class CaptureManager:
                 version=__version__,
             )
 
-            path = directory / FRAMES_FILENAME
+            path = directory / f"{self._config.id}.fits"
             try:
                 cube = FitsCube(
                     path,
@@ -438,9 +436,9 @@ class CaptureManager:
             )
 
     def _capture_dir(self, started_s: float, capture_id: str) -> Path:
-        """``<root>/<YYYYMMDD>/<capture id>/<camera id>/``."""
+        """``<root>/<YYYYMMDD>/<capture id>/``, shared by every camera's file."""
         date = time.strftime("%Y%m%d", time.gmtime(started_s))
-        return self._root / date / capture_id / self._config.id
+        return self._root / date / capture_id
 
     def _clock_reference(self) -> ClockReference:
         return self._pipeline.clock_reference()
